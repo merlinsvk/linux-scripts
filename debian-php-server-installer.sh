@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Interactive Debian server/PHP installer (v6).
+# Interactive Debian server/PHP installer (v7).
 # Run as root. The script intentionally targets Debian because the PHP and
 # MongoDB repository definitions below are Debian-specific.
 
@@ -522,7 +522,7 @@ install_lsphp() {
     if package_installed "$lsphp_full" || [[ -x "/usr/local/lsws/${lsphp_full}/bin/lsphp" ]]; then
         success "LSPHP $php_version is already installed; checking extension groups."
     else
-        ask_yes_no "Install LSPHP $php_version with recommended extensions?" || return 1
+        info "Installing LSPHP $php_version with recommended extensions..."
     fi
 
     for suffix in "${recommended_suffixes[@]}"; do
@@ -749,7 +749,6 @@ install_php() {
     if package_installed "${php_full}-cli" || command_exists "$php_full"; then
         success "PHP $php_version is already installed; checking extension groups and integration packages."
     else
-        ask_yes_no "Install PHP $php_version with recommended extensions?" || return 1
         info "Installing PHP $php_version and extensions..."
     fi
 
@@ -1061,49 +1060,90 @@ EOF_LIGHTTPD
 }
 
 install_composer() {
-    local php_full="$1"
+    local php_binary="$1"
     local runtime="${2:-standard}"
+    local installer='/tmp/composer-setup.php'
+    local expected_checksum=''
+    local actual_checksum=''
+    local composer_dir='/usr/local/lib/composer'
+    local composer_phar="${composer_dir}/composer.phar"
+    local composer_wrapper='/usr/local/bin/composer'
+    local php_exec=''
 
-    if command_exists composer; then
-        success "Composer is already installed."
+    if command_exists composer && composer --version >/dev/null 2>&1; then
+        success "Composer is already installed and usable."
         return 0
     fi
 
-    info "Automatically installing Composer..."
-
-    if [[ "$runtime" != 'lsphp' ]]; then
-        if run_apt_install composer; then
-            command_exists composer && {
-                success "Composer installed."
-                return 0
-            }
-        fi
-        info "APT installation failed; downloading Composer installer manually..."
+    if [[ "$runtime" == 'lsphp' ]]; then
+        php_exec="$php_binary"
     else
-        info "Using the selected LSPHP runtime for Composer to avoid installing a second system PHP runtime."
+        php_exec="$(command -v "$php_binary" 2>/dev/null || true)"
     fi
-    local installer='/tmp/composer-setup.php'
 
-    if ! "$php_full" -r "copy('https://getcomposer.org/installer', '$installer');"; then
+    [[ -n "$php_exec" && -x "$php_exec" ]] || {
+        error "Cannot install Composer because the selected PHP runtime is not executable: $php_binary"
+        return 1
+    }
+
+    info "Installing Composer using the selected PHP runtime..."
+
+    # Composer's documented programmatic installation flow: fetch the current
+    # installer signature and verify the downloaded installer with SHA-384.
+    expected_checksum="$("$php_exec" -r "copy('https://composer.github.io/installer.sig', 'php://stdout');" 2>/dev/null)" || {
+        error "Failed to download the Composer installer checksum."
+        return 1
+    }
+
+    [[ -n "$expected_checksum" ]] || {
+        error "Composer installer checksum is empty."
+        return 1
+    }
+
+    if ! "$php_exec" -r "copy('https://getcomposer.org/installer', '$installer');"; then
         rm -f "$installer"
-        error "Failed to download Composer installer."
+        error "Failed to download the Composer installer."
         return 1
     fi
 
-    if ! "$php_full" "$installer" --install-dir=/usr/local/bin --filename=composer; then
+    actual_checksum="$("$php_exec" -r "echo hash_file('sha384', '$installer');")" || {
+        rm -f "$installer"
+        error "Failed to calculate the Composer installer checksum."
+        return 1
+    }
+
+    if [[ "$expected_checksum" != "$actual_checksum" ]]; then
+        rm -f "$installer"
+        error "Composer installer checksum verification failed."
+        return 1
+    fi
+
+    mkdir -p "$composer_dir" || {
+        rm -f "$installer"
+        return 1
+    }
+
+    if ! "$php_exec" "$installer" --quiet --install-dir="$composer_dir" --filename=composer.phar; then
         rm -f "$installer"
         error "Composer installation failed."
         return 1
     fi
-
     rm -f "$installer"
 
-    if command_exists composer; then
-        success "Composer installed."
+    # Use a wrapper tied to the selected runtime. This is especially important
+    # for an OpenLiteSpeed-only installation where /usr/bin/php may not exist.
+    cat > "$composer_wrapper" <<EOF_COMPOSER_WRAPPER
+#!/usr/bin/env bash
+exec "$php_exec" "$composer_phar" "\$@"
+EOF_COMPOSER_WRAPPER
+    chmod 0755 "$composer_wrapper" || return 1
+
+    if "$composer_wrapper" --version >/dev/null 2>&1; then
+        success "Composer installed and verified."
         return 0
     fi
 
-    error "Composer installation completed without creating a usable composer command."
+    error "Composer was installed but failed its runtime check."
     return 1
 }
 
@@ -1423,9 +1463,11 @@ server_health_check() {
         fi
     fi
 
-    command_exists composer \
-        && echo -e "  ${GREEN}[OK]${NC} Composer" \
-        || echo -e "  ${YELLOW}[WARN]${NC} Composer not found"
+    if command_exists composer && composer --version >/dev/null 2>&1; then
+        echo -e "  ${GREEN}[OK]${NC} Composer"
+    else
+        echo -e "  ${YELLOW}[WARN]${NC} Composer not installed or not usable"
+    fi
 
     if command_exists ufw; then
         if ufw status 2>/dev/null | grep -q '^Status: active'; then
@@ -1626,45 +1668,65 @@ main() {
     echo
     local php_binary=''
     local php_runtime='standard'
+    local php_requested=false
+    local composer_requested=false
 
-    if [[ "$server_active" == 'openlitespeed' ]]; then
-        php_runtime='lsphp'
-        choose_lsphp_version php_full php_version || die "No valid LSPHP version was selected."
-        php_binary="/usr/local/lsws/${php_full}/bin/lsphp"
+    if ask_yes_no "Install PHP?"; then
+        php_requested=true
 
-        if install_lsphp "$php_full" "$php_version" "$db_active" "$cache_active"; then
-            php_installed=true
-            if configure_openlitespeed_lsphp "$php_full"; then
-                success "Native LSPHP integration for OpenLiteSpeed configured."
+        if [[ "$server_active" == 'openlitespeed' ]]; then
+            php_runtime='lsphp'
+            # OpenLiteSpeed uses its own LiteSpeed PHP packages/repository path;
+            # the Surý PHP repository is deliberately not added here.
+            choose_lsphp_version php_full php_version || die "No valid LSPHP version was selected."
+            php_binary="/usr/local/lsws/${php_full}/bin/lsphp"
+
+            if install_lsphp "$php_full" "$php_version" "$db_active" "$cache_active"; then
+                php_installed=true
+                if configure_openlitespeed_lsphp "$php_full"; then
+                    success "Native LSPHP integration for OpenLiteSpeed configured."
+                else
+                    error "LSPHP is installed, but OpenLiteSpeed configuration failed."
+                fi
             else
-                error "LSPHP is installed, but OpenLiteSpeed configuration failed."
+                info "LSPHP installation skipped or failed."
             fi
         else
-            info "LSPHP installation skipped or failed."
+            # Only add the external PHP repository after the administrator has
+            # explicitly requested PHP installation.
+            add_php_repository || die "Failed to configure the PHP repository."
+            choose_php_version php_full php_version || die "No valid PHP version was selected."
+            php_binary="$php_full"
+
+            if install_php "$php_full" "$php_version" "$server_active" "$db_active" "$cache_active"; then
+                php_installed=true
+
+                if [[ "$server_installed" == true ]]; then
+                    if configure_php_for_server "$server_active" "$php_full" "$php_version"; then
+                        success "PHP integration for ${server_active} configured."
+                    else
+                        error "PHP is installed, but configuration for ${server_active} failed."
+                    fi
+                fi
+            else
+                info "PHP installation skipped or failed."
+            fi
         fi
     else
-        add_php_repository || die "Failed to configure the PHP repository."
-        choose_php_version php_full php_version || die "No valid PHP version was selected."
-        php_binary="$php_full"
-
-        if install_php "$php_full" "$php_version" "$server_active" "$db_active" "$cache_active"; then
-            php_installed=true
-
-            if [[ "$server_installed" == true ]]; then
-                if configure_php_for_server "$server_active" "$php_full" "$php_version"; then
-                    success "PHP integration for ${server_active} configured."
-                else
-                    error "PHP is installed, but configuration for ${server_active} failed."
-                fi
-            fi
-        else
-            info "PHP installation skipped or failed."
-        fi
+        info "Skipping PHP installation. No PHP repository will be added."
     fi
 
     if [[ "$php_installed" == true ]]; then
-        if install_composer "$php_binary" "$php_runtime"; then
-            composer_installed=true
+        echo
+        if ask_yes_no "Install Composer?"; then
+            composer_requested=true
+            if install_composer "$php_binary" "$php_runtime"; then
+                composer_installed=true
+            else
+                error "Composer installation failed."
+            fi
+        else
+            info "Skipping Composer installation."
         fi
 
         php_extension_health_check "$php_binary" "$php_version" "$db_active" "$cache_active" \
@@ -1672,6 +1734,8 @@ main() {
 
         echo
         create_php_test_file "$server_active" || error "Failed to create the PHP test file."
+    elif [[ "$php_requested" == true ]]; then
+        error "PHP was requested but is not available; Composer and PHP-specific checks were skipped."
     fi
 
     # Optional server administration and operations tooling.
@@ -1722,13 +1786,20 @@ main() {
         else
             echo -e "${YELLOW}PHP Runtime:${NC} PHP $php_version (${php_full})"
         fi
-        if [[ "$composer_installed" == true ]] || command_exists composer; then
+        if [[ "$composer_installed" == true ]] || { command_exists composer && composer --version >/dev/null 2>&1; }; then
             echo -e "${YELLOW}Composer:${NC} Installed"
+        elif [[ "$composer_requested" == true ]]; then
+            echo -e "${YELLOW}Composer:${NC} Installation requested but not usable"
         else
-            echo -e "${YELLOW}Composer:${NC} Not installed"
+            echo -e "${YELLOW}Composer:${NC} Not selected"
         fi
     else
-        echo -e "${YELLOW}PHP Version:${NC} Not installed"
+        if [[ "$php_requested" == true ]]; then
+            echo -e "${YELLOW}PHP Version:${NC} Requested but installation failed/skipped"
+        else
+            echo -e "${YELLOW}PHP Version:${NC} Not selected"
+        fi
+        echo -e "${YELLOW}Composer:${NC} Not available without PHP runtime"
     fi
 
     local service_name=''
