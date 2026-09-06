@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Interactive Debian server/PHP installer (v7).
+# Interactive Debian server/PHP installer (v9).
 # Run as root. The script intentionally targets Debian because the PHP and
 # MongoDB repository definitions below are Debian-specific.
 
@@ -43,8 +43,49 @@ package_available() {
 ask_yes_no() {
     local prompt="$1"
     local answer
-    read -r -p "$prompt [y/n]: " answer
-    [[ "$answer" =~ ^[Yy]$ ]]
+
+    while true; do
+        if ! read -r -p "$prompt [y/n]: " answer; then
+            echo
+            error "Input stream closed while waiting for a yes/no answer."
+            return 1
+        fi
+
+        case "$answer" in
+            [Yy]|[Yy][Ee][Ss]) return 0 ;;
+            [Nn]|[Nn][Oo])     return 1 ;;
+            *) error "Invalid input. Please enter y/yes or n/no." ;;
+        esac
+    done
+}
+
+# Sets the global MENU_CHOICE variable. Empty input selects the supplied default.
+# Usage: ask_menu_choice "Prompt" MIN MAX DEFAULT
+MENU_CHOICE=''
+ask_menu_choice() {
+    local prompt="$1"
+    local min="$2"
+    local max="$3"
+    local default="$4"
+    local answer
+
+    while true; do
+        if ! read -r -p "$prompt" answer; then
+            echo
+            die "Input stream closed while waiting for a menu selection."
+        fi
+
+        if [[ -z "$answer" ]]; then
+            answer="$default"
+        fi
+
+        if [[ "$answer" =~ ^[0-9]+$ ]] && (( answer >= min && answer <= max )); then
+            MENU_CHOICE="$answer"
+            return 0
+        fi
+
+        error "Invalid selection. Enter a number from $min to $max (or press Enter for $default)."
+    done
 }
 
 run_apt_install() {
@@ -492,14 +533,8 @@ choose_lsphp_version() {
         ((i++))
     done
 
-    read -r -p "Choose LSPHP version (default 1 for newest): " choice
-    choice=${choice:-1}
-    if ! [[ "$choice" =~ ^[0-9]+$ ]] \
-        || (( choice < 1 || choice > ${#versions_array[@]} )); then
-        error "Invalid LSPHP selection."
-        return 1
-    fi
-
+    ask_menu_choice "Choose LSPHP version (default 1 for newest): " 1 "${#versions_array[@]}" 1
+    choice="$MENU_CHOICE"
     index=$((choice - 1))
     out_full="${versions_array[$index]}"
     digits="${out_full#lsphp}"
@@ -661,15 +696,8 @@ choose_php_version() {
         ((i++))
     done
 
-    read -r -p "Choose PHP version (default 1 for newest): " php_choice
-    php_choice=${php_choice:-1}
-
-    if ! [[ "$php_choice" =~ ^[0-9]+$ ]] \
-        || (( php_choice < 1 || php_choice > ${#versions_array[@]} )); then
-        error "Invalid PHP selection."
-        return 1
-    fi
-
+    ask_menu_choice "Choose PHP version (default 1 for newest): " 1 "${#versions_array[@]}" 1
+    php_choice="$MENU_CHOICE"
     php_index=$((php_choice - 1))
     out_full="${versions_array[$php_index]}"
     out_version="${out_full#php}"
@@ -684,16 +712,14 @@ choose_optional_php_extensions() {
 
     PHP_OPTIONAL_PACKAGES_SELECTED=()
     PHP_OPTIONAL_MODULES_SELECTED=()
-ADDITIONAL_TOOLS_SELECTED=()
-DB_UTILITY_PACKAGES_SELECTED=()
 
     echo
     info "Optional PHP extensions:"
     echo "1) None (default)"
     echo "2) All (ldap, soap, tidy, snmp)"
     echo "3) Select individually"
-    read -r -p "Choose optional PHP extensions [1-3] (default 1): " choice
-    choice=${choice:-1}
+    ask_menu_choice "Choose optional PHP extensions [1-3] (default 1): " 1 3 1
+    choice="$MENU_CHOICE"
 
     case "$choice" in
         1)
@@ -705,15 +731,13 @@ DB_UTILITY_PACKAGES_SELECTED=()
             ;;
         3)
             for module in ldap soap tidy snmp; do
-                read -r -p "Install PHP extension '$module'? [y/n]: " answer
-                if [[ "$answer" =~ ^[Yy]$ ]]; then
+                if ask_yes_no "Install PHP extension '$module'?"; then
                     PHP_OPTIONAL_MODULES_SELECTED+=("$module")
                 fi
             done
             ;;
         *)
-            error "Invalid optional-extension selection. No optional extensions will be installed."
-            return 0
+            die "Internal error: unexpected optional-extension selection '$choice'."
             ;;
     esac
 
@@ -1209,23 +1233,21 @@ choose_additional_tools() {
     echo "2) Recommended + diagnostics/monitoring CLI tools"
     echo "3) Select individually"
     echo "4) None"
-    read -r -p "Enter choice [1-4] (default 1): " choice
-    choice=${choice:-1}
+    ask_menu_choice "Enter choice [1-4] (default 1): " 1 4 1
+    choice="$MENU_CHOICE"
 
     case "$choice" in
         1) ADDITIONAL_TOOLS_SELECTED=("${recommended[@]}") ;;
         2) ADDITIONAL_TOOLS_SELECTED=("${all[@]}") ;;
         3)
             for tool in "${all[@]}"; do
-                read -r -p "Install '$tool'? [y/n]: " answer
-                [[ "$answer" =~ ^[Yy]$ ]] && ADDITIONAL_TOOLS_SELECTED+=("$tool")
+                if ask_yes_no "Install '$tool'?"; then
+                    ADDITIONAL_TOOLS_SELECTED+=("$tool")
+                fi
             done
             ;;
         4) ;;
-        *)
-            error "Invalid choice. Defaulting to Recommended tools."
-            ADDITIONAL_TOOLS_SELECTED=("${recommended[@]}")
-            ;;
+        *) die "Internal error: unexpected additional-tools selection '$choice'." ;;
     esac
 
     (( ${#ADDITIONAL_TOOLS_SELECTED[@]} > 0 )) \
@@ -1306,8 +1328,8 @@ install_security_tools() {
     echo "2) CrowdSec + firewall bouncer"
     echo "3) Both"
     echo "4) None (default)"
-    read -r -p "Enter choice [1-4] (default 4): " choice
-    choice=${choice:-4}
+    ask_menu_choice "Enter choice [1-4] (default 4): " 1 4 4
+    choice="$MENU_CHOICE"
 
     if [[ "$choice" == 1 || "$choice" == 3 ]]; then
         info "Installing Fail2ban..."
@@ -1543,8 +1565,8 @@ main() {
     echo "6) Lighttpd"
     echo "7) OpenLiteSpeed (native LSPHP runtime)"
     echo "8) Skip server installation"
-    read -r -p "Enter choice [1-8] (default 1): " server_choice
-    server_choice=${server_choice:-1}
+    ask_menu_choice "Enter choice [1-8] (default 1): " 1 8 1
+    server_choice="$MENU_CHOICE"
 
     case "$server_choice" in
         1) server_selected='apache' ;;
@@ -1555,10 +1577,7 @@ main() {
         6) server_selected='lighttpd' ;;
         7) server_selected='openlitespeed' ;;
         8) server_selected='skip' ;;
-        *)
-            error "Invalid choice. Defaulting to Apache."
-            server_selected='apache'
-            ;;
+        *) die "Internal error: unexpected web-server selection '$server_choice'." ;;
     esac
 
     case "$server_selected" in
@@ -1596,8 +1615,8 @@ main() {
     echo "4) MongoDB"
     echo "5) SQLite (PHP extension only - no server)"
     echo "6) Skip database installation"
-    read -r -p "Enter choice [1-6] (default 1): " db_choice
-    db_choice=${db_choice:-1}
+    ask_menu_choice "Enter choice [1-6] (default 1): " 1 6 1
+    db_choice="$MENU_CHOICE"
 
     case "$db_choice" in
         1) db_selected='mariadb' ;;
@@ -1606,10 +1625,7 @@ main() {
         4) db_selected='mongodb' ;;
         5) db_selected='sqlite' ;;
         6) db_selected='skip' ;;
-        *)
-            error "Invalid choice. Defaulting to MariaDB."
-            db_selected='mariadb'
-            ;;
+        *) die "Internal error: unexpected database selection '$db_choice'." ;;
     esac
 
     case "$db_selected" in
@@ -1640,17 +1656,14 @@ main() {
     echo "1) Redis Open Source"
     echo "2) Valkey"
     echo "3) Skip cache/key-value store installation (default)"
-    read -r -p "Enter choice [1-3] (default 3): " cache_choice
-    cache_choice=${cache_choice:-3}
+    ask_menu_choice "Enter choice [1-3] (default 3): " 1 3 3
+    cache_choice="$MENU_CHOICE"
 
     case "$cache_choice" in
         1) cache_selected='redis' ;;
         2) cache_selected='valkey' ;;
         3) cache_selected='skip' ;;
-        *)
-            error "Invalid choice. Defaulting to Skip."
-            cache_selected='skip'
-            ;;
+        *) die "Internal error: unexpected cache selection '$cache_choice'." ;;
     esac
 
     case "$cache_selected" in
