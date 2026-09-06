@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-# Interactive Debian server/PHP installer (v9).
+# Interactive Debian server/PHP installer (v10).
 # Run as root. The script intentionally targets Debian because the PHP and
 # MongoDB repository definitions below are Debian-specific.
 
@@ -1413,7 +1413,7 @@ install_certbot_tool() {
 
 service_health_line() {
     local label="$1" service="$2"
-    if systemctl is-active --quiet "$service" 2>/dev/null; then
+    if timeout 5s systemctl is-active --quiet "$service" 2>/dev/null; then
         echo -e "  ${GREEN}[OK]${NC} $label ($service)"
     else
         echo -e "  ${RED}[FAIL]${NC} $label ($service)"
@@ -1474,28 +1474,40 @@ server_health_check() {
         valkey) service_health_line "Valkey" valkey-server ;;
     esac
 
-    command_exists ss && port_health_line 80
-    command_exists ss && port_health_line 443
-
-    if command_exists curl && [[ "$server" != 'skip' && "$server" != 'frankenphp' ]]; then
-        if curl -fsSI --max-time 5 http://127.0.0.1/ >/dev/null 2>&1; then
-            echo -e "  ${GREEN}[OK]${NC} HTTP request to 127.0.0.1"
+    # Web-specific checks only make sense when a web server was actually
+    # selected and installed/detected. In particular, do not probe ports 80/443
+    # when server installation was skipped.
+    if [[ "$server" != 'skip' ]]; then
+        if command_exists ss; then
+            port_health_line 80
+            port_health_line 443
         else
-            echo -e "  ${YELLOW}[WARN]${NC} HTTP request to 127.0.0.1 failed"
+            echo -e "  ${YELLOW}[WARN]${NC} ss command not available; TCP port checks skipped"
         fi
+
+        if command_exists curl && [[ "$server" != 'frankenphp' ]]; then
+            if curl -fsSI --connect-timeout 2 --max-time 5 http://127.0.0.1/ >/dev/null 2>&1; then
+                echo -e "  ${GREEN}[OK]${NC} HTTP request to 127.0.0.1"
+            else
+                echo -e "  ${YELLOW}[WARN]${NC} HTTP request to 127.0.0.1 failed"
+            fi
+        fi
+    else
+        echo "  [SKIP] TCP/80 and TCP/443 checks (no web server selected)"
+        echo "  [SKIP] HTTP request check (no web server selected)"
     fi
 
-    if command_exists composer && composer --version >/dev/null 2>&1; then
+    if command_exists composer && timeout 5s composer --version >/dev/null 2>&1; then
         echo -e "  ${GREEN}[OK]${NC} Composer"
     else
-        echo -e "  ${YELLOW}[WARN]${NC} Composer not installed or not usable"
+        echo -e "  ${YELLOW}[WARN]${NC} Composer not installed, not usable, or check timed out"
     fi
 
     if command_exists ufw; then
-        if ufw status 2>/dev/null | grep -q '^Status: active'; then
+        if timeout 5s ufw status 2>/dev/null | grep -q '^Status: active'; then
             echo -e "  ${GREEN}[OK]${NC} UFW active"
         else
-            echo -e "  ${YELLOW}[WARN]${NC} UFW installed but inactive"
+            echo -e "  ${YELLOW}[WARN]${NC} UFW installed but inactive/unavailable"
         fi
     else
         echo -e "  ${YELLOW}[WARN]${NC} UFW not installed"
