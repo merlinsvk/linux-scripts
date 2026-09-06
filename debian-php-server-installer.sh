@@ -1198,7 +1198,7 @@ install_package_set_if_available() {
 
 choose_additional_tools() {
     local choice answer tool
-    local recommended=(rsync cron unzip dnsutils net-tools wget tar zip git jq htop ncdu lsof logrotate)
+    local recommended=(rsync cron unzip dnsutils net-tools wget curl tar zip git mc btop jq htop ncdu lsof logrotate)
     local diagnostics=(iotop iftop nload strace tree tcpdump iproute2)
     local all=("${recommended[@]}" "${diagnostics[@]}")
 
